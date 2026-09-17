@@ -1,0 +1,330 @@
+name: CPU AI Image Benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      OMP_NUM_THREADS: 4
+      OPENBLAS_NUM_THREADS: 4
+      MKL_NUM_THREADS: 4
+      NUMEXPR_NUM_THREADS: 4
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "CPU AI IMAGE BENCHMARK"
+          echo "========================================"
+
+          echo
+          echo "CPU:"
+          lscpu | grep -E \
+            'Model name|CPU\(s\)|Thread|Core|Socket|Architecture' \
+            || true
+
+          echo
+          echo "MEMORY:"
+          free -h
+
+          echo
+          echo "DISK:"
+          df -h /
+
+          echo
+          echo "========================================"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            git \
+            wget \
+            curl \
+            pkg-config \
+            libopenblas-dev \
+            libwebp-dev \
+            libavif-dev \
+            python3 \
+            python3-pip \
+            imagemagick
+
+      - name: Build stable-diffusion.cpp CPU engine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf stable-diffusion.cpp
+
+          git clone \
+            --depth 1 \
+            https://github.com/leejet/stable-diffusion.cpp.git
+
+          cd stable-diffusion.cpp
+
+          mkdir build
+          cd build
+
+          cmake .. \
+            -DGGML_OPENBLAS=ON \
+            -DSD_USE_SYSTEM_WEBP=ON
+
+          cmake \
+            --build . \
+            --config Release \
+            --parallel 4
+
+          echo
+          echo "=== BUILD OUTPUT ==="
+          find . -maxdepth 3 -type f \
+            \( -name "sd-cli" -o -name "sd-cli.exe" \) \
+            -print
+
+          test -x ./bin/sd-cli
+
+      - name: Prepare model directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p models
+          mkdir -p benchmark
+          mkdir -p output
+
+      - name: Download Stable Diffusion 1.5
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODEL_URL="https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors?download=true"
+
+          if [ -f models/sd15.safetensors ]; then
+            echo "Model already exists."
+          else
+            echo "Downloading Stable Diffusion 1.5..."
+
+            wget \
+              --progress=dot:giga \
+              --tries=5 \
+              --timeout=60 \
+              -O models/sd15.safetensors \
+              "$MODEL_URL"
+          fi
+
+          ls -lh models/sd15.safetensors
+
+          test -s models/sd15.safetensors
+
+      - name: Quantize model to Q4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SD="./stable-diffusion.cpp/build/bin/sd-cli"
+
+          if [ -f models/sd15-q4.gguf ]; then
+            echo "Quantized model already exists."
+          else
+            echo "Converting SD 1.5 to Q4..."
+
+            "$SD" \
+              -M convert \
+              -m models/sd15.safetensors \
+              -o models/sd15-q4.gguf \
+              -v \
+              --type q4_0
+          fi
+
+          ls -lh models/
+
+          test -s models/sd15-q4.gguf
+
+      - name: Generate CPU test images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SD="./stable-diffusion.cpp/build/bin/sd-cli"
+          MODEL="models/sd15-q4.gguf"
+
+          THREADS="$(nproc)"
+          THREADS=$((THREADS < 4 ? THREADS : 4))
+
+          echo "Using CPU threads: $THREADS"
+
+          generate() {
+            local NAME="$1"
+            local PROMPT="$2"
+            local SEED="$3"
+
+            local OUT="output/${NAME}.png"
+            local LOG="benchmark/${NAME}.log"
+
+            echo
+            echo "========================================"
+            echo "GENERATING: ${NAME}"
+            echo "========================================"
+
+            START="$(date +%s)"
+
+            "$SD" \
+              -m "$MODEL" \
+              -p "$PROMPT" \
+              -W 512 \
+              -H 512 \
+              --steps 12 \
+              --sampling-method euler \
+              --cfg-scale 7.0 \
+              -s "$SEED" \
+              -t "$THREADS" \
+              --backend cpu \
+              -o "$OUT" \
+              2>&1 | tee "$LOG"
+
+            END="$(date +%s)"
+
+            SECONDS=$((END - START))
+
+            echo "$SECONDS" > "benchmark/${NAME}.seconds"
+
+            echo
+            echo "${NAME}: ${SECONDS} seconds"
+
+            test -s "$OUT"
+          }
+
+          generate \
+            "scene_01_event" \
+            "premium cinematic hand-drawn 2D cartoon illustration, feature-animation frame, a young adult man urgently unlocking an old apartment door with a metal key, the key visibly entering and turning inside the lock, close three-quarter camera angle focused on the hands, key and lock, worried expression partially visible, detailed apartment hallway, dramatic warm evening light, painterly digital color, clean confident ink outlines, restrained cel shading, believable perspective, strong foreground and background depth, no text, no watermark, no posed portrait, the action of unlocking the door is the dominant visual event" \
+            "1101"
+
+          generate \
+            "scene_02_supporting_action" \
+            "premium cinematic hand-drawn 2D cartoon illustration, feature-animation frame, an elderly shopkeeper dropping a stack of cardboard boxes as a small frightened child reaches toward a fallen object on the floor, the falling boxes and reaching hands are the dominant action, camera positioned low beside the boxes, busy neighborhood shop interior, expressive body language, warm practical lighting, painterly digital color, clean dark ink outlines, restrained cel shading, believable perspective, strong foreground midground background depth, no text, no watermark, do not center a protagonist portrait" \
+            "2202"
+
+          generate \
+            "scene_03_object_event" \
+            "premium cinematic hand-drawn 2D cartoon illustration, feature-animation frame, a red bicycle suddenly rolling downhill by itself after its kickstand has fallen away, an adult man running after it in the background but not dominating the frame, the moving bicycle is the primary visual subject, dynamic low tracking-camera composition, residential street, scattered leaves moving through the air, late afternoon sunlight, cinematic motion feeling, painterly digital color, clean confident ink outlines, restrained cel shading, believable perspective, detailed environment, no text, no watermark, no static standing pose" \
+            "3303"
+
+      - name: Collect benchmark metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "CPU Image Benchmark" > benchmark/report.txt
+          echo "===================" >> benchmark/report.txt
+          echo >> benchmark/report.txt
+
+          echo "Runner CPU:" >> benchmark/report.txt
+          lscpu | grep -E \
+            'Model name|CPU\(s\)|Thread|Core|Socket|Architecture' \
+            >> benchmark/report.txt \
+            || true
+
+          echo >> benchmark/report.txt
+
+          echo "Memory:" >> benchmark/report.txt
+          free -h >> benchmark/report.txt
+
+          echo >> benchmark/report.txt
+          echo "Image generation times:" >> benchmark/report.txt
+
+          TOTAL=0
+          COUNT=0
+
+          for FILE in benchmark/*.seconds; do
+            [ -f "$FILE" ] || continue
+
+            NAME="$(basename "$FILE" .seconds)"
+            VALUE="$(cat "$FILE")"
+
+            echo "${NAME}: ${VALUE} seconds" \
+              | tee -a benchmark/report.txt
+
+            TOTAL=$((TOTAL + VALUE))
+            COUNT=$((COUNT + 1))
+          done
+
+          echo >> benchmark/report.txt
+
+          if [ "$COUNT" -gt 0 ]; then
+            AVG=$((TOTAL / COUNT))
+
+            echo "Total generation time: ${TOTAL} seconds" \
+              | tee -a benchmark/report.txt
+
+            echo "Average generation time: ${AVG} seconds/image" \
+              | tee -a benchmark/report.txt
+          fi
+
+          echo >> benchmark/report.txt
+          echo "Output files:" >> benchmark/report.txt
+          ls -lh output >> benchmark/report.txt
+
+          echo
+          cat benchmark/report.txt
+
+      - name: Create contact sheet
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v montage >/dev/null 2>&1; then
+            montage \
+              output/scene_01_event.png \
+              output/scene_02_supporting_action.png \
+              output/scene_03_object_event.png \
+              -thumbnail 512x512 \
+              -tile 3x1 \
+              -geometry +10+10 \
+              output/contact_sheet.jpg
+          else
+            echo "ImageMagick montage unavailable; skipping contact sheet."
+          fi
+
+      - name: Final validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for IMAGE in output/*.png; do
+            test -s "$IMAGE"
+            file "$IMAGE"
+          done
+
+          test -s benchmark/report.txt
+
+          echo
+          echo "========================================"
+          echo "BENCHMARK COMPLETED"
+          echo "========================================"
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-ai-image-benchmark
+          path: |
+            output/
+            benchmark/
+          retention-days: 7
